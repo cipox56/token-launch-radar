@@ -302,13 +302,16 @@
 
   function modelPanel() {
     var m = DATA.model;
+    var dc = DATA.driver_counts;
+    var driverLine = dc ? ('Drivers across the board: ' + dc.tvl + ' rows led by size, ' + dc.growth + ' by seven-day growth, ' + dc.age + ' by age with no token, ' + dc.multiple + ' by category pricing — no single input decides the ranking.') : '';
     return el('section', { class: 'panel model' },
       el('h2', { text: 'How implied value is computed' }),
       el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
       el('div', { class: 'formula' },
         'implied = round( tvl_usd x category_multiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') )'
       ),
-      el('p', { class: 'sub', text: 'category_multiple is the market\u2019s own mcap/TVL for the protocol\u2019s category, measured from the token-trading protocols in this snapshot (at least ' + m.min_category_comparables + ' comparables, otherwise the market median of ' + fmtMult(DATA.overall_multiple) + '; the factor is bounded between ' + m.category_factor_floor + 'x and ' + m.category_factor_cap + 'x). TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days.' })
+      el('p', { class: 'sub', text: 'category_multiple is the market\u2019s own mcap/TVL for the protocol\u2019s category, measured from the token-trading protocols in this snapshot (at least ' + m.min_category_comparables + ' comparables, otherwise the market median of ' + fmtMult(DATA.overall_multiple) + '; the factor is bounded between ' + m.category_factor_floor + 'x and ' + m.category_factor_cap + 'x). TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days.' }),
+      dc ? el('p', { class: 'sub', text: driverLine }) : null
     );
   }
 

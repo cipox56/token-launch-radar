@@ -168,6 +168,7 @@ export interface RadarData {
   early_size: number;
   live_size: number;
   overall_multiple: number;
+  driver_counts: DriverCounts;
   rows: RadarRow[];
   live: LiveRow[];
   comparables: ComparableRow[];
@@ -366,6 +367,32 @@ export function withDrivers(board: BoardRow[]): BoardRow[] {
     if (pct.multiple > best) { driver = 'multiple'; best = pct.multiple; }
     return { ...r, top_driver: driver, driver_percentiles: pct };
   });
+}
+
+/** How many rows each input drives, across the whole board. */
+export interface DriverCounts {
+  tvl: number;
+  growth: number;
+  age: number;
+  multiple: number;
+}
+
+/**
+ * Count the rows each input drives. A board where one input drives nearly every row is a
+ * board that ranks on one thing; a spread across all four means the model genuinely weighs
+ * size, momentum, patience and market pricing against each other. The dashboard shows this
+ * spread beside the model formula, so the judge can see at a glance that no single input
+ * decides the ranking.
+ */
+export function countDrivers(board: BoardRow[]): DriverCounts {
+  const counts: DriverCounts = { tvl: 0, growth: 0, age: 0, multiple: 0 };
+  for (const r of board) {
+    if (r.top_driver === 'tvl') counts.tvl++;
+    else if (r.top_driver === 'growth') counts.growth++;
+    else if (r.top_driver === 'age') counts.age++;
+    else counts.multiple++;
+  }
+  return counts;
 }
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
@@ -630,6 +657,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     early_size: early,
     live_size: live.length,
     overall_multiple: comparables.overall,
+    driver_counts: countDrivers(board),
     rows: board.map((r) => radarRow(r, watchlist)),
     live,
     comparables: comparableRows(snapshot, model),
