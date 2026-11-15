@@ -328,6 +328,9 @@
     var growthRank = rankOf(DATA.rows, function (r) { return r.change_7d; }, row.change_7d, true);
     var ageRank = rankOf(DATA.rows, function (r) { return r.age_days; }, row.age_days, true);
     var why = 'Rank ' + row.rank + ' because its TVL is #' + tvlRank + ' of ' + DATA.board_size + (growthRank ? ', its seven-day growth is #' + growthRank : '') + (ageRank ? ', and its age with no token is #' + ageRank : '') + '.';
+    var driverLabel = { tvl: 'sheer size (TVL)', growth: 'seven-day momentum', age: 'time running with no token', multiple: 'its category\u2019s market pricing' }[row.top_driver] || 'its size';
+    var driverPct = row.driver_percentiles ? row.driver_percentiles[row.top_driver] : null;
+    var driverLine = 'Strongest driver: ' + driverLabel + (driverPct !== null && driverPct !== undefined ? ' (top ' + (100 - driverPct) + '% of the board on this input).' : '.');
     dialog.textContent = '';
     dialog.appendChild(el('div', { class: 'detail-head' },
       el('div', null,
@@ -353,6 +356,7 @@
         el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
       ),
       el('p', { class: 'sub', text: why }),
+      el('p', { class: 'sub', text: driverLine }),
       el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(impliedOf(row, DATA.model)) + (impliedOf(row, DATA.model) === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' })
     ));
     dialog.appendChild(el('section', { class: 'detail-section' },

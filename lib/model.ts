@@ -98,6 +98,8 @@ export interface BoardRow {
   token_status: 'pre-token';
   age_days: number | null;
   implied_value_usd: number;
+  top_driver: TopDriver;
+  driver_percentiles: { tvl: number; growth: number; age: number; multiple: number };
   model: {
     base_multiple: number;
     category_multiple: number;
@@ -124,6 +126,8 @@ export interface RadarRow {
   listed_at: string | null;
   age_days: number | null;
   implied_value_usd: number;
+  top_driver: TopDriver;
+  driver_percentiles: { tvl: number; growth: number; age: number; multiple: number };
   growth_multiplier: number;
   maturity_multiplier: number;
   category_multiple: number;
@@ -321,6 +325,49 @@ export interface BoardSummary {
   live_size: number;
 }
 
+/** Which input most drives one row's rank: the input where the row stands furthest above the board. */
+export type TopDriver = 'tvl' | 'growth' | 'age' | 'multiple';
+
+/** The percentile of one value among a list, 0 (lowest) to 100 (highest); nulls sit at the bottom. */
+function percentileOf(value: number | null, all: (number | null)[]): number {
+  const present = all.filter((v): v is number => v !== null && v !== undefined && Number.isFinite(v)).sort((a, b) => a - b);
+  if (present.length === 0 || value === null || value === undefined || !Number.isFinite(value)) return 0;
+  let below = 0;
+  for (const v of present) if (v < value) below++;
+  // A value equal to the median sits at 50; the largest sits at 100.
+  return Math.round((below / Math.max(1, present.length - 1)) * 100);
+}
+
+/**
+ * Tag every row with the input that most drives its rank. The driver is the input whose
+ * percentile among the board is highest: a row that ranks on sheer size is driven by TVL,
+ * one that ranks on momentum by seven-day growth, one that ranks on patience by age with
+ * no token, and one that ranks on its category's market pricing by its multiple. Ties break
+ * toward TVL, then growth, then age, then multiple, so the tag is deterministic. This is
+ * the "why this rank" in one word, computed from the same board the dashboard shows.
+ */
+export function withDrivers(board: BoardRow[]): BoardRow[] {
+  const tvls = board.map((r) => r.tvl_usd);
+  const growths = board.map((r) => r.change_7d);
+  const ages = board.map((r) => r.age_days);
+  const multiples = board.map((r) => r.model.category_multiple);
+  return board.map((r) => {
+    const pct = {
+      tvl: percentileOf(r.tvl_usd, tvls),
+      growth: percentileOf(r.change_7d, growths),
+      age: percentileOf(r.age_days, ages),
+      multiple: percentileOf(r.model.category_multiple, multiples),
+    };
+    // The strongest driver wins; on a tie the earlier input in this order wins.
+    let driver: TopDriver = 'tvl';
+    let best = pct.tvl;
+    if (pct.growth > best) { driver = 'growth'; best = pct.growth; }
+    if (pct.age > best) { driver = 'age'; best = pct.age; }
+    if (pct.multiple > best) { driver = 'multiple'; best = pct.multiple; }
+    return { ...r, top_driver: driver, driver_percentiles: pct };
+  });
+}
+
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
   const comparables = measureComparables(snapshot);
@@ -343,7 +390,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     return { p, ...v };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
-  return scored.map((s, i) => ({
+  const rows = scored.map((s, i) => ({
     rank: i + 1,
     slug: s.p.slug,
     name: s.p.name,
@@ -358,6 +405,9 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     token_status: 'pre-token',
     age_days: s.age,
     implied_value_usd: s.implied,
+    // Placeholders: withDrivers below measures each row against the whole board and replaces them.
+    top_driver: 'tvl' as TopDriver,
+    driver_percentiles: { tvl: 0, growth: 0, age: 0, multiple: 0 },
     model: {
       base_multiple: s.multiple,
       category_multiple: s.multiple,
@@ -370,6 +420,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
   }));
+  return withDrivers(rows);
 }
 
 const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
@@ -551,6 +602,8 @@ export function radarRow(row: BoardRow, watchlist: Set<string>): RadarRow {
     listed_at: row.listed_at,
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
+    top_driver: row.top_driver,
+    driver_percentiles: row.driver_percentiles,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     category_multiple: row.model.category_multiple,
