@@ -39,6 +39,14 @@
     if (n === null || n === undefined || !isFinite(n)) return 'n/a';
     return n.toFixed(3) + 'x';
   }
+  function fmtCost(n) {
+    if (n === null || n === undefined || !isFinite(n)) return 'n/a';
+    return '$' + n.toFixed(2);
+  }
+  function fmtRange(r) {
+    if (r.rank_low === undefined || r.rank_high === undefined || r.rank_low === null || r.rank_high === null) return '';
+    return '(' + r.rank_low + '–' + r.rank_high + ')';
+  }
   // The model in one function: the page recomputes a row from the snapshot figures and checks the
   // number board.json carries, so the page's code and the board's data are visibly the same arithmetic.
   function impliedOf(row, model) {
@@ -217,7 +225,7 @@
         onclick: function () { openDetail(r.slug); },
         onkeydown: function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDetail(r.slug); } }
       },
-        el('td', { class: 'num', text: String(r.rank) }),
+        el('td', { class: 'num' }, el('span', { text: String(r.rank) }), el('span', { class: 'rank-range', text: fmtRange(r) })),
         el('td', null, el('div', { class: 'name' },
           el('span', null,
             el('b', { text: r.name }),
@@ -232,6 +240,7 @@
           el('div', { class: 'bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' })),
           el('span', { class: 'num', text: fmtUsd(r.implied_value_usd) })
         )),
+        el('td', { class: 'num' }, el('span', { class: 'verdict verdict-' + String(r.plan_verdict).toLowerCase(), text: r.plan_verdict || 'n/a' }), el('span', { class: 'rank-range', text: fmtCost(r.plan_cost_usd) + ' gas' })),
         el('td', null, el('span', { class: 'status', text: 'no token' }))
       );
       tbody.appendChild(tr);
@@ -239,7 +248,7 @@
     return el('div', { class: 'panel' },
       el('div', { class: 'table-wrap' },
         el('table', null,
-          el('caption', { class: 'sub', text: 'Pre-token protocols, strongest implied value first. Select a row for its model and farm plan.' }),
+          el('caption', { class: 'sub', text: 'Pre-token protocols, strongest implied value first. Rank shows the bootstrap range (p10–p90 over 100 refits) in brackets; Plan is the farm verdict and its gas cost. Select a row for its model and farm plan.' }),
           el('thead', null, el('tr', null,
             sortHeader('implied', 'Rank'),
             sortHeader('name', 'Protocol'),
@@ -247,6 +256,7 @@
             sortHeader('growth', '7d'),
             sortHeader('age', 'Age'),
             sortHeader('implied', 'Implied value'),
+            el('th', { scope: 'col', text: 'Plan' }),
             el('th', { scope: 'col', text: 'Token' })
           )),
           tbody
@@ -391,6 +401,34 @@
     );
   }
 
+  /** Leave-one-out validation, computed at build time from the same snapshot and shipped with the
+   * data: the page's recompute of implied value does not re-derive it. The comparison with the
+   * flat multiple is reported as measured, whichever way it falls. */
+  function validationPanel() {
+    var v = DATA.validation;
+    if (!v) return null;
+    var diff = v.flat_median_abs_pct_error - v.median_abs_pct_error;
+    var cmp = diff > 0
+      ? 'The category adjustment beats the flat multiple by ' + diff.toFixed(2) + ' points of median error (' + v.median_abs_pct_error + '% vs ' + v.flat_median_abs_pct_error + '%).'
+      : diff < 0
+        ? 'The category adjustment does not beat the flat multiple on this snapshot: the flat multiple\u2019s median error is ' + (-diff).toFixed(2) + ' points lower, and it lands within 2x more often (' + v.flat_within_2x_pct + '% vs ' + v.within_2x_pct + '%).'
+        : 'The category adjustment ties the flat multiple on median error (' + v.median_abs_pct_error + '% each).';
+    return el('section', { class: 'panel model' },
+      el('h2', { text: 'Model validation: leave-one-out test' }),
+      el('p', { class: 'sub', text: 'Tested on ' + v.n + ' live comparables: hide each one, reprice it from the remaining comparables with the same rules (winsorized ratios, category median, shrink n/(n+3), factor bounds [0.5, 2]), predict its market cap as TVL x category multiple x maturity — no growth multiplier, since a live token\u2019s 7d move is a market move, not a launch signal — and compare with its real market cap.' }),
+      el('div', { class: 'facts' },
+        el('div', { class: 'fact' }, el('span', { text: 'Comparables tested' }), el('b', { text: String(v.n) })),
+        el('div', { class: 'fact' }, el('span', { text: 'Median absolute error' }), el('b', { text: v.median_abs_pct_error + '%' })),
+        el('div', { class: 'fact' }, el('span', { text: 'Predictions within 2x' }), el('b', { text: v.within_2x_pct + '%' })),
+        el('div', { class: 'fact' }, el('span', { text: 'Predictions within 1.5x' }), el('b', { text: v.within_1_5x_pct + '%' })),
+        el('div', { class: 'fact' }, el('span', { text: 'Flat multiple: median error' }), el('b', { text: v.flat_median_abs_pct_error + '%' })),
+        el('div', { class: 'fact' }, el('span', { text: 'Flat multiple: within 2x / 1.5x' }), el('b', { text: v.flat_within_2x_pct + '% / ' + v.flat_within_1_5x_pct + '%' }))
+      ),
+      el('p', { class: 'sub', text: cmp }),
+      el('p', { class: 'sub', text: 'The model is a rough pricing heuristic, not a price forecast: a median error near ' + Math.round(v.median_abs_pct_error) + '% means half the predictions land more than ' + Math.round(v.median_abs_pct_error) + '% away from the real market cap. That is why the board also shows bootstrap rank ranges beside each rank. Validation is computed at build time from the same snapshot and shipped with the data; the page\u2019s recompute of implied value does not re-derive it.' })
+    );
+  }
+
   var dialog = el('dialog', { class: 'detail', id: 'detail', 'aria-labelledby': 'detail-title' });
   dialog.addEventListener('close', function () { state.selected = null; writeHash(); });
 
@@ -413,7 +451,7 @@
     dialog.textContent = '';
     dialog.appendChild(el('div', { class: 'detail-head' },
       el('div', null,
-        el('span', { class: 'brand-name', text: 'Rank ' + row.rank + ' of ' + DATA.board_size + (row.watchlist ? '  ·  Watchlist' : '') }),
+        el('span', { class: 'brand-name', text: 'Rank ' + row.rank + ' of ' + DATA.board_size + ' · range ' + row.rank_low + '–' + row.rank_high + ' (100 bootstrap refits)' + (row.watchlist ? '  ·  Watchlist' : '') }),
         el('h2', { id: 'detail-title', text: row.name }),
         el('p', { class: 'sub', text: (row.category || 'Other') + ' on ' + (row.chains && row.chains.length ? row.chains.join(', ') : 'an unnamed chain') })
       ),
@@ -439,11 +477,17 @@
       el('p', { class: 'sub', text: driverLine }),
       el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(impliedOf(row, DATA.model)) + (impliedOf(row, DATA.model) === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' })
     ));
+    var verdictNote = {
+      FARM: 'gas is under 5% of the capital, so the plan is worth running.',
+      THIN: 'gas is 5–20% of the capital, so it only pays if the launch rewards generously.',
+      SKIP: 'gas is over 20% of the capital, so the plan costs more in gas than it is worth.'
+    }[row.plan_verdict] || '';
     dialog.appendChild(el('section', { class: 'detail-section' },
       el('div', { class: 'section-head' },
         el('h3', { text: 'Farm plan' }),
         el('button', { class: 'button', type: 'button', text: 'Copy plan', onclick: function () { copyPlan(row, steps); } })
       ),
+      el('p', { class: 'sub', text: 'Plan cost: ' + fmtCost(row.plan_cost_usd) + ' gas over ' + row.plan_hold_days + ' days on $' + row.plan_capital_usd + ' capital · Verdict: ' + row.plan_verdict + ' — ' + verdictNote + ' Thresholds: FARM under 5% of capital, THIN 5–20%, SKIP over 20%. Capital is at risk, not a cost.' }),
       el('ol', { class: 'steps' }, steps.map(function (s) {
         var at = s.indexOf(' Cost: ');
         var action = at >= 0 ? s.slice(0, at) : s;
@@ -477,6 +521,7 @@
       shell.appendChild(scatterPanel());
       shell.appendChild(comparablesPanel());
       shell.appendChild(modelPanel());
+      shell.appendChild(validationPanel());
     }
     app.appendChild(shell);
     app.setAttribute('aria-busy', 'false');

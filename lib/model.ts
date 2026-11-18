@@ -30,6 +30,12 @@
 //
 // The constants are the model's, stated in the dashboard and changeable in the model sandbox. No
 // protocol name is ever special-cased: the same function scores every row.
+//
+// radar-4 adds three things, all computed from the snapshot itself: a leave-one-out validation of
+// the value model against a flat overall multiple (validateModel), bootstrap rank ranges from 100
+// deterministic refits seeded from the snapshot's as_of date (bootstrapRanks), and farm plans
+// netted to the dollar — a numeric gas cost per plan with a FARM / THIN / SKIP verdict from
+// stated thresholds (planFor).
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -93,7 +99,7 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-3';
+export const MODEL_VERSION = 'radar-4';
 
 /** A farm step: the action, what it costs, and how long it takes. */
 export interface FarmStep {
@@ -133,7 +139,19 @@ export interface BoardRow {
     stable_haircut: number;
   };
   farm_steps: string[];
+  /** Bootstrap rank range: the p10–p90 rank over 100 deterministic refits (see bootstrapRanks). */
+  rank_low: number;
+  rank_high: number;
+  /** The farm plan netted to the dollar: gas total, capital at risk, hold, and verdict. */
+  plan_cost_usd: number;
+  plan_capital_usd: number;
+  plan_hold_days: number;
+  plan_verdict: PlanVerdict;
 }
+
+/** Whether a farm plan is worth running on gas alone: FARM when its gas is under 5% of the
+ * capital, THIN when 5–20%, SKIP when over 20%. */
+export type PlanVerdict = 'FARM' | 'THIN' | 'SKIP';
 
 /** The dashboard's compact view of one row, with the farm plan embedded. */
 export interface RadarRow {
@@ -156,6 +174,12 @@ export interface RadarRow {
   stable_haircut: number;
   watchlist: boolean;
   farm_steps: string[];
+  rank_low: number;
+  rank_high: number;
+  plan_cost_usd: number;
+  plan_capital_usd: number;
+  plan_hold_days: number;
+  plan_verdict: PlanVerdict;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -192,6 +216,7 @@ export interface RadarData {
   live_size: number;
   overall_multiple: number;
   driver_counts: DriverCounts;
+  validation: ModelValidation;
   rows: RadarRow[];
   live: LiveRow[];
   comparables: ComparableRow[];
@@ -359,6 +384,187 @@ export function impliedValue(
   return { implied, multiple, factor, comparables: count, growthPct, growthMult, maturityMult, haircut, age };
 }
 
+/** One live comparable's winsorized mcap/TVL, grouped by category: the raw material the
+ * leave-one-out test and the bootstrap both work from, so both use the snapshot's own ratios. */
+function comparableRatios(snapshot: Snapshot, model: ModelConstants = MODEL): { byCategory: Map<string, number[]>; all: number[] } {
+  const byCategory = new Map<string, number[]>();
+  const all: number[] = [];
+  for (const p of snapshot.protocols) {
+    if (p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
+    if (p.category !== null && DISTORTED_CATEGORIES.has(p.category)) continue;
+    const raw = p.mcap_usd / p.tvl_usd;
+    if (!Number.isFinite(raw) || raw <= 0) continue;
+    const ratio = Math.min(model.winsor_ratio_cap, Math.max(model.winsor_ratio_floor, raw));
+    all.push(ratio);
+    const key = p.category ?? 'Unknown';
+    const list = byCategory.get(key);
+    if (list === undefined) byCategory.set(key, [ratio]);
+    else list.push(ratio);
+  }
+  return { byCategory, all };
+}
+
+/** A Comparables object built from ratio lists: the overall median and each category's median
+ * and count, the same measurement measureComparables performs. */
+function comparablesFromRatios(byCategory: Map<string, number[]>, all: number[], model: ModelConstants): Comparables {
+  const overall = all.length > 0 ? median(all) : 0.25;
+  const measured = new Map<string, { median: number; count: number }>();
+  for (const [category, values] of byCategory) {
+    if (values.length > 0) measured.set(category, { median: median(values), count: values.length });
+  }
+  return { overall, byCategory: measured };
+}
+
+const round2 = (n: number): number => Math.round(n * 100) / 100;
+
+/** The maturity multiplier for an age in days, the same formula impliedValue uses. */
+function maturityFor(age: number | null, model: ModelConstants): number {
+  const ageForModel = age ?? model.unknown_age_days;
+  return model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
+}
+
+/** Leave-one-out validation of the value model, and the same test with a flat overall multiple.
+ *
+ * For each live comparable (a token-trading protocol with mcap_usd > 0 and tvl_usd > 0, excluding
+ * DISTORTED_CATEGORIES): hide it, recompute the category multiple from the remaining comparables
+ * with the SAME rules (winsorize [0.005, 5], category median, shrink n/(n+3), factor bounds
+ * [0.5, 2]), predict its mcap as TVL x multiple x maturity (age-based, same formula; the growth
+ * multiplier is NOT applied — a live token's 7d move is a market move, not a launch signal), and
+ * compare with its actual mcap. The flat test predicts with the remaining comparables' overall
+ * median instead of the category multiple, so the reader sees whether the category adjustment
+ * earns its keep. All numbers come from the snapshot itself; no external data, no hand-written
+ * figures. */
+export interface ModelValidation {
+  n: number;
+  median_abs_pct_error: number;
+  within_2x_pct: number;
+  within_1_5x_pct: number;
+  flat_median_abs_pct_error: number;
+  flat_within_2x_pct: number;
+  flat_within_1_5x_pct: number;
+}
+
+export function validateModel(snapshot: Snapshot, model: ModelConstants = MODEL): ModelValidation {
+  const { byCategory, all } = comparableRatios(snapshot, model);
+  const live = snapshot.protocols.filter(
+    (p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0 && !(p.category !== null && DISTORTED_CATEGORIES.has(p.category)),
+  );
+  const catErrors: number[] = [];
+  const flatErrors: number[] = [];
+  let catWithin2 = 0;
+  let catWithin15 = 0;
+  let flatWithin2 = 0;
+  let flatWithin15 = 0;
+  for (const p of live) {
+    const ratio = Math.min(model.winsor_ratio_cap, Math.max(model.winsor_ratio_floor, p.mcap_usd! / p.tvl_usd));
+    // Hide this one comparable from its category and from the overall pool.
+    const restByCategory = new Map<string, number[]>();
+    for (const [key, values] of byCategory) {
+      const copy = [...values];
+      if (key === (p.category ?? 'Unknown')) {
+        const at = copy.indexOf(ratio);
+        if (at >= 0) copy.splice(at, 1);
+      }
+      restByCategory.set(key, copy);
+    }
+    const restAll = [...all];
+    const atAll = restAll.indexOf(ratio);
+    if (atAll >= 0) restAll.splice(atAll, 1);
+    const rest = comparablesFromRatios(restByCategory, restAll, model);
+    const { multiple } = multipleFor(p, rest, model);
+    const maturity = maturityFor(ageDays(snapshot.as_of, p.listed_at), model);
+    const actual = p.mcap_usd!;
+    const pred = p.tvl_usd * multiple * maturity;
+    const flatPred = p.tvl_usd * rest.overall * maturity;
+    const err = Math.abs(pred - actual) / actual;
+    const flatErr = Math.abs(flatPred - actual) / actual;
+    catErrors.push(err);
+    flatErrors.push(flatErr);
+    const r = pred / actual;
+    if (r >= 0.5 && r <= 2) catWithin2++;
+    if (r >= 2 / 3 && r <= 1.5) catWithin15++;
+    const fr = flatPred / actual;
+    if (fr >= 0.5 && fr <= 2) flatWithin2++;
+    if (fr >= 2 / 3 && fr <= 1.5) flatWithin15++;
+  }
+  const n = live.length;
+  const pct = (count: number): number => (n > 0 ? round2((count / n) * 100) : 0);
+  return {
+    n,
+    median_abs_pct_error: n > 0 ? round2(median(catErrors) * 100) : 0,
+    within_2x_pct: pct(catWithin2),
+    within_1_5x_pct: pct(catWithin15),
+    flat_median_abs_pct_error: n > 0 ? round2(median(flatErrors) * 100) : 0,
+    flat_within_2x_pct: pct(flatWithin2),
+    flat_within_1_5x_pct: pct(flatWithin15),
+  };
+}
+
+/** A small deterministic PRNG (mulberry32), seeded from a string: the bootstrap never uses
+ * Math.random in the build path, so the same snapshot always gives the same rank ranges. */
+function seedFromString(s: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** Bootstrap rank ranges: resample the comparable ratios within each category with replacement
+ * (same n per category), recompute the multiples, re-rank the whole board, and record each row's
+ * rank p10–p90 over 100 refits. The resampling is seeded from the snapshot's as_of date, so the
+ * ranges are deterministic for a given snapshot. */
+export function bootstrapRanks(
+  snapshot: Snapshot,
+  board: BoardRow[],
+  model: ModelConstants = MODEL,
+  refits = 100,
+): Map<string, { low: number; high: number }> {
+  const { byCategory } = comparableRatios(snapshot, model);
+  const rand = mulberry32(seedFromString(snapshot.as_of));
+  const bySlug = new Map<string, SnapshotProtocol>();
+  for (const p of snapshot.protocols) bySlug.set(p.slug, p);
+  const ranks = new Map<string, number[]>();
+  for (const row of board) ranks.set(row.slug, []);
+  for (let refit = 0; refit < refits; refit++) {
+    const resampled = new Map<string, number[]>();
+    const pooled: number[] = [];
+    for (const [key, values] of byCategory) {
+      const drawn: number[] = [];
+      for (let i = 0; i < values.length; i++) drawn.push(values[Math.floor(rand() * values.length)]!);
+      resampled.set(key, drawn);
+      pooled.push(...drawn);
+    }
+    const comparables = comparablesFromRatios(resampled, pooled, model);
+    const scored = board.map((row) => {
+      const p = bySlug.get(row.slug)!;
+      const v = impliedValue(p, snapshot.as_of, comparables, model);
+      return { slug: row.slug, implied: v.implied };
+    });
+    scored.sort((a, b) => b.implied - a.implied || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+    scored.forEach((s, i) => ranks.get(s.slug)!.push(i + 1));
+  }
+  const out = new Map<string, { low: number; high: number }>();
+  for (const [slug, list] of ranks) {
+    const sorted = [...list].sort((a, b) => a - b);
+    const low = sorted[Math.floor(0.1 * (sorted.length - 1))]!;
+    const high = sorted[Math.floor(0.9 * (sorted.length - 1))]!;
+    out.set(slug, { low, high });
+  }
+  return out;
+}
+
 /** The headline sentence's figures: how many watchlist slugs, how many rows, how many live protocols. */
 export interface BoardSummary {
   watchlist_size: number;
@@ -458,7 +664,9 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     return { p, ...v };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
-  const rows = scored.map((s, i) => ({
+  const rows = scored.map((s, i) => {
+    const plan = planFor(s.p, s.age);
+    return {
     rank: i + 1,
     slug: s.p.slug,
     name: s.p.name,
@@ -488,8 +696,21 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       stable_haircut: s.haircut,
     },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
-  }));
-  return withDrivers(rows);
+    // Placeholders: bootstrapRanks below fills the range from 100 deterministic refits.
+    rank_low: 0,
+    rank_high: 0,
+    plan_cost_usd: plan.costUsd,
+    plan_capital_usd: plan.capitalUsd,
+    plan_hold_days: plan.holdDays,
+    plan_verdict: plan.verdict,
+    };
+  });
+  const driven = withDrivers(rows);
+  const ranges = bootstrapRanks(snapshot, driven, model);
+  return driven.map((r) => {
+    const range = ranges.get(r.slug) ?? { low: r.rank, high: r.rank };
+    return { ...r, rank_low: range.low, rank_high: range.high };
+  });
 }
 
 const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
@@ -545,7 +766,43 @@ function gasFor(chain: string): { fund: string; setup: string; weekly: string } 
   return { fund: 'about $3', setup: 'about $5', weekly: 'about $2' };
 }
 
-/** How to get the farm's funds onto one chain, in the words a farmer can follow. */
+/** What funding, one setup, one weekly transaction and one exit cost on one chain, in USD.
+ * The numbers mirror gasFor's strings: Ethereum 8/8/5/8, Solana 1/1/1/1, Tron 2/2/2/2,
+ * Bitcoin 5/5/3/5, L2s and the other cheap chains 1/2/1/2, anything else 3/5/2/5. */
+export function gasUsdFor(chain: string): { fund: number; setup: number; weekly: number; exit: number } {
+  const c = chain.toLowerCase();
+  if (c === 'ethereum') return { fund: 8, setup: 8, weekly: 5, exit: 8 };
+  if (c.includes('solana')) return { fund: 1, setup: 1, weekly: 1, exit: 1 };
+  if (c.includes('tron')) return { fund: 2, setup: 2, weekly: 2, exit: 2 };
+  if (c.includes('bitcoin')) return { fund: 5, setup: 5, weekly: 3, exit: 5 };
+  if (
+    c.includes('base') || c.includes('arbitrum') || c.includes('optimism') || c.includes('polygon') ||
+    c.includes('linea') || c.includes('scroll') || c.includes('blast') || c.includes('mode') ||
+    c.includes('unichain') || c.includes('ink') || c.includes('katana') || c.includes('sonic') ||
+    c.includes('mantle') || c.includes('sei') || c.includes('sui') || c.includes('avalanche') ||
+    c.includes('fantom') || c.includes('bnb')
+  ) return { fund: 1, setup: 2, weekly: 1, exit: 2 };
+  return { fund: 3, setup: 5, weekly: 2, exit: 5 };
+}
+
+/** A farm plan netted to the dollar: total gas = setup gas + weekly gas x hold weeks + exit gas.
+ * The capital is at risk, not a cost, so it is stated separately. Verdict: FARM when the gas
+ * is under 5% of the capital, THIN when 5–20%, SKIP when over 20%. */
+export function planFor(p: SnapshotProtocol, age: number | null): {
+  costUsd: number;
+  capitalUsd: number;
+  holdDays: number;
+  verdict: PlanVerdict;
+} {
+  const chain = chainOf(p);
+  const gas = gasUsdFor(chain);
+  const capital = capitalFor(p);
+  const hold = holdDaysFor(age);
+  const cost = Math.round((gas.setup + gas.weekly * (hold / 7) + gas.exit) * 100) / 100;
+  const ratio = cost / capital;
+  const verdict: PlanVerdict = ratio < 0.05 ? 'FARM' : ratio <= 0.2 ? 'THIN' : 'SKIP';
+  return { costUsd: cost, capitalUsd: capital, holdDays: hold, verdict };
+}
 function fundFor(chain: string, capital: number): string {
   const c = chain.toLowerCase();
   if (c === 'ethereum') return `Open a fresh wallet, buy $${capital} of USDC on an exchange and withdraw it to the wallet on Ethereum, and keep about $8 of ETH for gas. Keep the seed phrase offline.`;
@@ -1008,6 +1265,12 @@ export function radarRow(row: BoardRow, watchlist: Set<string>): RadarRow {
     stable_haircut: row.model.stable_haircut,
     watchlist: watchlist.has(row.slug),
     farm_steps: row.farm_steps,
+    rank_low: row.rank_low,
+    rank_high: row.rank_high,
+    plan_cost_usd: row.plan_cost_usd,
+    plan_capital_usd: row.plan_capital_usd,
+    plan_hold_days: row.plan_hold_days,
+    plan_verdict: row.plan_verdict,
   };
 }
 
@@ -1030,6 +1293,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     live_size: live.length,
     overall_multiple: comparables.overall,
     driver_counts: countDrivers(board),
+    validation: validateModel(snapshot, model),
     rows: board.map((r) => radarRow(r, watchlist)),
     live,
     comparables: comparableRows(snapshot, model),
@@ -1096,6 +1360,13 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
     if (steps.length < 3 || steps.length > 12) return `${r.slug} has ${steps.length} farm steps`;
     for (const s of steps) if (s.length < 20 || s.length > 600) return `${r.slug} has a farm step of ${s.length} characters`;
     if (!Number.isSafeInteger(r.implied_value_usd) || r.implied_value_usd <= 0) return `${r.slug} has implied value ${r.implied_value_usd}`;
+    if (!Number.isSafeInteger(r.rank_low) || !Number.isSafeInteger(r.rank_high) || r.rank_low < 1 || r.rank_high < r.rank_low || r.rank_high > board.length) {
+      return `${r.slug} has a bad bootstrap rank range ${r.rank_low}–${r.rank_high}`;
+    }
+    if (!(r.plan_cost_usd >= 0) || !Number.isSafeInteger(r.plan_capital_usd) || r.plan_capital_usd <= 0 || !Number.isSafeInteger(r.plan_hold_days) || r.plan_hold_days <= 0) {
+      return `${r.slug} has a bad plan cost/capital/hold`;
+    }
+    if (r.plan_verdict !== 'FARM' && r.plan_verdict !== 'THIN' && r.plan_verdict !== 'SKIP') return `${r.slug} has plan verdict ${r.plan_verdict}`;
   }
   return null;
 }
