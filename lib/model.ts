@@ -10,14 +10,23 @@
 //
 // Implied value follows only from the snapshot's own figures, by comparables:
 //
+//   ratio      = each token-trading protocol's mcap/TVL, winsorized to [0.005, 5]
+//                (the snapshot's own 5th/95th percentiles; one 400x outlier cannot move a median)
 //   multiple   = the market's own mcap/TVL for this category, measured from the snapshot's
-//                token-trading protocols (median, at least 3 comparables; otherwise the
-//                whole-market median), bounded so one noisy category cannot dominate
+//                token-trading protocols and shrunk toward the market median: a category with
+//                n comparables carries weight n / (n + 3), so one comparable moves the multiple
+//                only a quarter of the way from the market median, and five carry it most of the
+//                way; the blended factor is bounded to [0.5, 2]
 //   base       = tvl_usd x multiple
-//   growth     = clamp(change_7d, -60, 120) per cent
+//   growth     = clamp(change_7d, -40, 60) per cent — the snapshot's only trend field, and its
+//                largest weekly move is +4,448%, so the clamp is what keeps one spike from
+//                deciding a rank
 //   growthMult = 1 + (growth / 100) x GROWTH_WEIGHT
 //   maturity   = 0.6 + min(age_days, 1095) / 1095 x 0.4   (age_days unknown: 365)
-//   implied    = max(1, round(base x growthMult x maturity))
+//   haircut    = 0.5 for a stable-asset protocol (CDP, dual-token stablecoin, stablecoin
+//                wrapper): its TVL is largely the pegged asset's own outstanding supply, not
+//                fee-earning deposits, so a token priced off that TVL is halved; else 1
+//   implied    = max(1, round(base x growthMult x maturity x haircut))
 //
 // The constants are the model's, stated in the dashboard and changeable in the model sandbox. No
 // protocol name is ever special-cased: the same function scores every row.
@@ -57,12 +66,19 @@ export interface ModelConstants {
   min_category_comparables: number;
   category_factor_floor: number;
   category_factor_cap: number;
+  /** Winsor bounds for one comparable's mcap/TVL before any median is taken. */
+  winsor_ratio_floor: number;
+  winsor_ratio_cap: number;
+  /** Shrinkage prior: a category with n comparables carries weight n / (n + shrink_prior). */
+  shrink_prior: number;
+  /** Multiplier applied to a stable-asset protocol's implied value (see isStableAsset). */
+  stable_haircut: number;
 }
 
 export const MODEL: ModelConstants = {
   growth_weight: 0.5,
-  growth_floor: -60,
-  growth_cap: 120,
+  growth_floor: -40,
+  growth_cap: 60,
   maturity_floor: 0.6,
   maturity_range: 0.4,
   maturity_days: 1095,
@@ -70,10 +86,14 @@ export const MODEL: ModelConstants = {
   min_category_comparables: 3,
   category_factor_floor: 0.5,
   category_factor_cap: 2.0,
+  winsor_ratio_floor: 0.005,
+  winsor_ratio_cap: 5.0,
+  shrink_prior: 3,
+  stable_haircut: 0.5,
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** A farm step: the action, what it costs, and how long it takes. */
 export interface FarmStep {
@@ -109,6 +129,8 @@ export interface BoardRow {
     growth_multiplier: number;
     maturity_multiplier: number;
     age_days: number | null;
+    /** 0.5 for a stable-asset protocol, else 1: its TVL is largely the pegged asset's own supply. */
+    stable_haircut: number;
   };
   farm_steps: string[];
 }
@@ -131,6 +153,7 @@ export interface RadarRow {
   growth_multiplier: number;
   maturity_multiplier: number;
   category_multiple: number;
+  stable_haircut: number;
   watchlist: boolean;
   farm_steps: string[];
 }
@@ -246,20 +269,23 @@ function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
   return new Map(protocols.map((p) => [p.slug, p]));
 }
 
-/** The market's own mcap/TVL multiples, measured from the snapshot's token-trading protocols. */
+/** The market's own mcap/TVL multiples, measured from the snapshot's token-trading protocols.
+ * Each ratio is winsorized to [winsor_ratio_floor, winsor_ratio_cap] before any median is
+ * taken, so a 400x outlier (the snapshot's largest ratio) cannot move a category's median. */
 export interface Comparables {
   overall: number;
   byCategory: Map<string, { median: number; count: number }>;
 }
 
-export function measureComparables(snapshot: Snapshot): Comparables {
+export function measureComparables(snapshot: Snapshot, model: ModelConstants = MODEL): Comparables {
   const byCategory = new Map<string, number[]>();
   const all: number[] = [];
   for (const p of snapshot.protocols) {
     if (p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
     if (p.category !== null && DISTORTED_CATEGORIES.has(p.category)) continue;
-    const ratio = p.mcap_usd / p.tvl_usd;
-    if (!Number.isFinite(ratio) || ratio <= 0) continue;
+    const raw = p.mcap_usd / p.tvl_usd;
+    if (!Number.isFinite(raw) || raw <= 0) continue;
+    const ratio = Math.min(model.winsor_ratio_cap, Math.max(model.winsor_ratio_floor, raw));
     all.push(ratio);
     const key = p.category ?? 'Unknown';
     const list = byCategory.get(key);
@@ -274,7 +300,10 @@ export function measureComparables(snapshot: Snapshot): Comparables {
   return { overall, byCategory: measured };
 }
 
-/** The multiple one protocol's implied value uses: its category's, bounded, or the market's. */
+/** The multiple one protocol's implied value uses: its category's median, shrunk toward the
+ * market median by n / (n + shrink_prior), so a category with one comparable moves the multiple
+ * only a quarter of the way from the market median instead of deciding it outright; the blended
+ * factor is bounded to [category_factor_floor, category_factor_cap]. */
 export function multipleFor(
   protocol: SnapshotProtocol,
   comparables: Comparables,
@@ -282,12 +311,22 @@ export function multipleFor(
 ): { multiple: number; factor: number; comparables: number } {
   const key = protocol.category ?? 'Unknown';
   const measured = comparables.byCategory.get(key);
-  if (measured !== undefined && measured.count >= model.min_category_comparables) {
+  if (measured !== undefined && measured.count > 0) {
     const rawFactor = measured.median / comparables.overall;
-    const factor = Math.min(model.category_factor_cap, Math.max(model.category_factor_floor, rawFactor));
+    const clamped = Math.min(model.category_factor_cap, Math.max(model.category_factor_floor, rawFactor));
+    const weight = measured.count / (measured.count + model.shrink_prior);
+    const factor = 1 + weight * (clamped - 1);
     return { multiple: comparables.overall * factor, factor, comparables: measured.count };
   }
-  return { multiple: comparables.overall, factor: 1, comparables: measured?.count ?? 0 };
+  return { multiple: comparables.overall, factor: 1, comparables: 0 };
+}
+
+/** Categories whose TVL is largely a pegged asset's own outstanding supply. */
+const STABLE_ASSET_CATEGORIES = new Set(['CDP', 'Dual-Token Stablecoin', 'Stablecoin Wrapper', 'Stablecoin']);
+
+/** Whether a protocol's TVL is largely a pegged asset's own supply, so its implied value is halved. */
+export function isStableAsset(p: SnapshotProtocol): boolean {
+  return p.category !== null && STABLE_ASSET_CATEGORIES.has(p.category);
 }
 
 /** The three multipliers and the implied value one protocol gets under `model`. */
@@ -304,6 +343,7 @@ export function impliedValue(
   growthPct: number;
   growthMult: number;
   maturityMult: number;
+  haircut: number;
   age: number | null;
 } {
   const age = ageDays(asOf, protocol.listed_at);
@@ -313,9 +353,10 @@ export function impliedValue(
   const growthMult = 1 + (growthPct / 100) * model.growth_weight;
   const ageForModel = age ?? model.unknown_age_days;
   const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
+  const haircut = isStableAsset(protocol) ? model.stable_haircut : 1;
   const base = protocol.tvl_usd * multiple;
-  const implied = Math.max(1, Math.round(base * growthMult * maturityMult));
-  return { implied, multiple, factor, comparables: count, growthPct, growthMult, maturityMult, age };
+  const implied = Math.max(1, Math.round(base * growthMult * maturityMult * haircut));
+  return { implied, multiple, factor, comparables: count, growthPct, growthMult, maturityMult, haircut, age };
 }
 
 /** The headline sentence's figures: how many watchlist slugs, how many rows, how many live protocols. */
@@ -397,7 +438,7 @@ export function countDrivers(board: BoardRow[]): DriverCounts {
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
-  const comparables = measureComparables(snapshot);
+  const comparables = measureComparables(snapshot, model);
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug, even one the snapshot no longer carries (it cannot, but
@@ -444,6 +485,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
       age_days: s.age,
+      stable_haircut: s.haircut,
     },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
   }));
@@ -465,6 +507,11 @@ function chainOf(p: SnapshotProtocol): string {
   return p.chains.length > 0 ? p.chains[0]! : 'its main chain';
 }
 
+/** The second chain a protocol names, or null: a multi-chain protocol's farm spans two chains. */
+function secondChainOf(p: SnapshotProtocol): string | null {
+  return p.chains.length > 1 ? p.chains[1]! : null;
+}
+
 /** How much capital one farm position needs, from the protocol's own TVL. */
 function capitalFor(p: SnapshotProtocol): number {
   if (p.tvl_usd >= 5_000_000_000) return 250;
@@ -481,96 +528,415 @@ function holdDaysFor(age: number | null): number {
   return 30;
 }
 
-/** Whether the protocol's first chain is a low-fee chain, which changes the gas wording. */
-function isLowFeeChain(chain: string): boolean {
+/** What funding, one setup and one weekly transaction cost on one chain. */
+function gasFor(chain: string): { fund: string; setup: string; weekly: string } {
   const c = chain.toLowerCase();
-  return c.includes('base') || c.includes('arbitrum') || c.includes('optimism') || c.includes('solana') || c.includes('polygon') || c.includes('bnb') || c.includes('blast') || c.includes('mode') || c.includes('scroll') || c.includes('linea');
+  if (c === 'ethereum') return { fund: 'about $8', setup: 'about $8', weekly: 'about $5' };
+  if (c.includes('solana')) return { fund: 'under $1', setup: 'about $1', weekly: 'under $1' };
+  if (c.includes('tron')) return { fund: 'about $2', setup: 'about $2', weekly: 'about $2' };
+  if (c.includes('bitcoin')) return { fund: 'about $5', setup: 'about $5', weekly: 'about $3' };
+  if (
+    c.includes('base') || c.includes('arbitrum') || c.includes('optimism') || c.includes('polygon') ||
+    c.includes('linea') || c.includes('scroll') || c.includes('blast') || c.includes('mode') ||
+    c.includes('unichain') || c.includes('ink') || c.includes('katana') || c.includes('sonic') ||
+    c.includes('mantle') || c.includes('sei') || c.includes('sui') || c.includes('avalanche') ||
+    c.includes('fantom') || c.includes('bnb')
+  ) return { fund: 'under $1', setup: 'about $2', weekly: 'under $1' };
+  return { fund: 'about $3', setup: 'about $5', weekly: 'about $2' };
 }
 
-/** The category's one action, in the words a farmer can follow. */
-function actionFor(p: SnapshotProtocol, capital: number, chain: string): string {
-  const c = (p.category ?? '').toLowerCase();
-  const name = p.name;
-  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) return `Supply $${capital} of USDC to ${name} on ${chain} and borrow a small amount against it, then repay the borrow.`;
-  if (c.includes('dex') || c.includes('leveraged farm')) return `Provide $${capital} of liquidity to ${name}'s main pool on ${chain} and keep the position open.`;
-  if (c.includes('yield') && !c.includes('aggregator')) return `Deposit $${capital} into ${name}'s highest-yield vault on ${chain} and keep the shares.`;
-  if (c.includes('aggregator')) return `Deposit $${capital} into ${name}'s top vault on ${chain} and keep the shares.`;
-  if (c.includes('bridge')) return `Bridge $${capital} of USDC to ${chain} through ${name} and use the bridged funds in its app.`;
-  if (c.includes('staking') || c.includes('restak')) return `Stake $${capital} of the chain's staking asset through ${name} and keep the receipt.`;
-  if (c.includes('perpetual') || c.includes('derivative') || c.includes('options')) return `Deposit $${capital} of USDC as margin on ${name} and open one small hedged trade.`;
-  if (c.includes('prediction')) return `Fund $${capital} and place one market position on ${name}.`;
-  if (c.includes('curator') || c.includes('allocator')) return `Deposit $${capital} into a ${name} vault on ${chain} and keep the shares.`;
-  if (c.includes('stable')) return `Mint or deposit $${capital} of the stable asset through ${name} on ${chain}.`;
-  if (c.includes('rwa')) return `Mint $${capital} of the protocol's yield-bearing asset on ${chain} and hold it.`;
-  if (c.includes('insurance')) return `Buy $${capital} of cover from ${name} on ${chain} and keep the policy.`;
-  if (c.includes('farm')) return `Deposit $${capital} into ${name}'s main farm on ${chain} and keep the position open.`;
-  if (c.includes('chain')) return `Bridge $${capital} of USDC onto ${name} and use it in one of its apps.`;
-  if (c.includes('basis')) return `Deposit $${capital} into ${name}'s basis vault on ${chain} and keep the shares.`;
-  if (c.includes('liquidity manager')) return `Deposit $${capital} into a ${name} managed position on ${chain} and keep it open.`;
-  return `Deposit $${capital} of USDC into ${name} on ${chain} and keep the position open.`;
+/** How to get the farm's funds onto one chain, in the words a farmer can follow. */
+function fundFor(chain: string, capital: number): string {
+  const c = chain.toLowerCase();
+  if (c === 'ethereum') return `Open a fresh wallet, buy $${capital} of USDC on an exchange and withdraw it to the wallet on Ethereum, and keep about $8 of ETH for gas. Keep the seed phrase offline.`;
+  if (c.includes('solana')) return `Open a fresh wallet, buy $${capital} of USDC on an exchange and withdraw it as an SPL token to the wallet on Solana. Keep the seed phrase offline.`;
+  if (c.includes('tron')) return `Open a fresh wallet, buy $${capital} of USDT on an exchange and withdraw it to the wallet on Tron, keeping a little TRX for energy. Keep the seed phrase offline.`;
+  if (c.includes('base') || c.includes('arbitrum') || c.includes('optimism') || c.includes('polygon') || c.includes('linea') || c.includes('scroll') || c.includes('blast') || c.includes('mode') || c.includes('unichain') || c.includes('ink') || c.includes('katana') || c.includes('sonic') || c.includes('mantle') || c.includes('sei') || c.includes('sui') || c.includes('avalanche') || c.includes('fantom') || c.includes('bnb')) return `Open a fresh wallet and bridge $${capital} of USDC onto ${chain} through its official bridge, keeping a little of the chain's gas token aside. Keep the seed phrase offline.`;
+  return `Open a fresh wallet and fund it with $${capital} of USDC on ${chain} through the protocol's own app, keeping a little of the chain's gas token aside. Keep the seed phrase offline.`;
 }
 
-/** The category's one risk, in the words a farmer can weigh. */
-function riskFor(p: SnapshotProtocol): string {
-  const c = (p.category ?? '').toLowerCase();
-  if (c.includes('perpetual') || c.includes('derivative') || c.includes('options') || c.includes('leveraged')) return `Perpetual and leveraged positions can be liquidated in a sharp move, so keep the position small and the leverage low.`;
-  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) return `A borrow can be liquidated if the collateral falls, so borrow well under the limit and watch the health factor.`;
-  if (c.includes('bridge')) return `A bridge moves funds across chains, so use only the protocol's own app and never a link from a chat or a search ad.`;
-  if (c.includes('staking') || c.includes('restak')) return `Staked assets can be locked or slashed, so check the unlock time before you stake.`;
-  if (c.includes('dex')) return `Liquidity positions lose to impermanent loss when prices move apart, so prefer a stable pair for a first position.`;
-  if (c.includes('rwa')) return `Real-world assets depend on an off-chain issuer, so read who holds the reserves before you mint.`;
-  if (c.includes('yield') || c.includes('curator') || c.includes('allocator')) return `A vault's yield can fall as more capital enters, so check the current rate before you deposit.`;
-  if (c.includes('stable')) return `A stable asset can lose its peg, so do not put in funds you need at short notice.`;
-  if (c.includes('farm')) return `Farm rewards can fall as more farmers join, so check the current rate before you deposit.`;
-  return `Smart contracts can fail, so use only the funds you plan to farm and keep the position small.`;
+/** The chain's own extra risk, added to the category's risk. */
+function chainRisk(chain: string): string {
+  const c = chain.toLowerCase();
+  if (c === 'ethereum') return `On Ethereum, gas spikes can make small exits costly, so batch the weekly actions.`;
+  if (c.includes('solana')) return `On Solana, congestion can delay a transaction, so check it landed before you repeat it.`;
+  if (c.includes('tron')) return `On Tron, energy costs rise when the network is busy, so keep a little TRX aside.`;
+  if (c.includes('bitcoin')) return `On Bitcoin, wrapping and unwrapping adds a step and a fee, so test with a small amount first.`;
+  if (c.includes('base') || c.includes('arbitrum') || c.includes('optimism') || c.includes('polygon') || c.includes('linea') || c.includes('scroll') || c.includes('blast') || c.includes('mode') || c.includes('unichain') || c.includes('ink') || c.includes('katana') || c.includes('sonic') || c.includes('mantle') || c.includes('sei') || c.includes('sui') || c.includes('avalanche') || c.includes('fantom') || c.includes('bnb')) return `On ${chain}, the bridge back to Ethereum takes minutes and a small fee, so leave time for the exit.`;
+  return `On ${chain}, fees and finality depend on the chain, so check each transaction landed before you repeat it.`;
+}
+
+/** The fields one farm step is built from: the protocol, its main chain, its capital and its hold. */
+interface FarmCtx {
+  n: string;
+  c: string;
+  k: number;
+  h: number;
+  hold: number;
+}
+
+/** One category's farm profile: its core action, its weekly action, its milestone, its
+ * eligibility check, its exit and its risk. Every field is written for that category's own
+ * mechanics, never a slogan, and every one takes the protocol's name, chain, capital and hold
+ * from its own snapshot record. */
+interface FarmProfile {
+  core: (x: FarmCtx) => string;
+  weekly: (x: FarmCtx) => string;
+  milestone: (x: FarmCtx) => string;
+  check: (x: FarmCtx) => string;
+  unwind: (x: FarmCtx) => string;
+  risk: string;
+}
+
+const LENDING: FarmProfile = {
+  core: (x) => `Supply $${x.k} of USDC to ${x.n} on ${x.c} and borrow $25 of USDC against it, keeping the borrow small.`,
+  weekly: (x) => `Top up the supply by $10 or adjust the borrow on ${x.n}, and confirm the health factor is still above 2.`,
+  milestone: (x) => `Keep the supply above $${x.k} and the health factor above 2 for ${x.hold} days, with at least four weekly actions.`,
+  check: (x) => `Open ${x.n}'s own dashboard on ${x.c} and check the borrow health and any points balance before you move anything.`,
+  unwind: (x) => `Repay the $25 borrow in full first, then withdraw the USDC supply and close the position.`,
+  risk: `A borrow can be liquidated if the collateral falls, so borrow well under the limit and watch the health factor.`,
+};
+
+const CDP: FarmProfile = {
+  core: (x) => `Lock $${x.k} of ETH as collateral in ${x.n} on ${x.c} and mint $25 of its stable asset against it.`,
+  weekly: (x) => `Check the collateral ratio on ${x.n} and top it up by $10 if it has slipped toward the liquidation line.`,
+  milestone: (x) => `Keep the collateral ratio above 200% for ${x.hold} days without letting the minted stable asset sit idle.`,
+  check: (x) => `Open ${x.n}'s own page on ${x.c} and confirm the collateral ratio and any points balance before you repay.`,
+  unwind: (x) => `Repay the $25 of minted stable asset, then withdraw the ETH collateral in full.`,
+  risk: `A CDP can be liquidated if the collateral falls, and its stable asset can lose its peg, so keep the ratio high.`,
+};
+
+const DEX: FarmProfile = {
+  core: (x) => `Provide $${x.k} of liquidity to ${x.n}'s main USDC pair on ${x.c} in a narrow range and keep the position open.`,
+  weekly: (x) => `Swap $10 through ${x.n} on ${x.c} and collect any fees the liquidity position has earned.`,
+  milestone: (x) => `Keep the position open for ${x.hold} days and route at least $${x.k} of swaps through ${x.n} in that time.`,
+  check: (x) => `Open ${x.n}'s own pools page on ${x.c} and check the fees earned and any points balance before you remove liquidity.`,
+  unwind: (x) => `Remove the liquidity, swap the pair tokens back to USDC, and confirm the final balance.`,
+  risk: `Liquidity positions lose to impermanent loss when prices move apart, so prefer a stable pair for a first position.`,
+};
+
+const MANAGED_LP: FarmProfile = {
+  core: (x) => `Deposit $${x.k} of USDC into a ${x.n} managed position on ${x.c} and let it rebalance the range for you.`,
+  weekly: (x) => `Check the managed position's range on ${x.n} and add $10 if it has drifted out of range.`,
+  milestone: (x) => `Keep the managed position funded for ${x.hold} days through at least two rebalances.`,
+  check: (x) => `Open ${x.n}'s own page on ${x.c} and check the position value and any points balance before you withdraw.`,
+  unwind: (x) => `Withdraw the managed position back to USDC and confirm the final balance.`,
+  risk: `A managed position still loses to impermanent loss, and its rebalancing can sell low and buy high in choppy markets.`,
+};
+
+const AGGREGATOR: FarmProfile = {
+  core: (x) => `Deposit $${x.k} of USDC into ${x.n}'s top vault on ${x.c} and keep the vault shares.`,
+  weekly: (x) => `Check the vault's rate on ${x.n} and move $10 into its best-performing strategy if the rate has fallen.`,
+  milestone: (x) => `Hold the vault shares for ${x.hold} days and keep the deposit above $${x.k} through the whole window.`,
+  check: (x) => `Open ${x.n}'s own vaults page on ${x.c} and check the shares and any points balance before you withdraw.`,
+  unwind: (x) => `Redeem the vault shares for USDC and confirm the final balance.`,
+  risk: `A vault's yield can fall as more capital enters, and its strategies can change, so check the current rate before you deposit.`,
+};
+
+const YIELD_VAULT: FarmProfile = {
+  core: (x) => `Deposit $${x.k} into ${x.n}'s highest-yield vault on ${x.c} and keep the shares.`,
+  weekly: (x) => `Claim any yield the vault has paid on ${x.n} and redeposit $10 of it into the same vault.`,
+  milestone: (x) => `Hold the vault shares for ${x.hold} days and compound the yield at least twice.`,
+  check: (x) => `Open ${x.n}'s own vault page on ${x.c} and check the shares, the yield earned and any points balance.`,
+  unwind: (x) => `Redeem the vault shares for USDC and confirm the final balance.`,
+  risk: `A vault's yield can fall as more capital enters, so check the current rate before you deposit.`,
+};
+
+const CURATOR: FarmProfile = {
+  core: (x) => `Deposit $${x.k} into a ${x.n} vault on ${x.c} and keep the shares; note which curator manages it.`,
+  weekly: (x) => `Check the vault's curator and rate on ${x.n}, and add $10 to a second ${x.n} vault run by a different curator.`,
+  milestone: (x) => `Hold vault shares across two curators for ${x.hold} days, keeping at least $${x.k} deposited in total.`,
+  check: (x) => `Open ${x.n}'s own vaults page on ${x.c} and check each vault's shares and any points balance.`,
+  unwind: (x) => `Redeem the shares from each ${x.n} vault back to USDC and confirm the final balance.`,
+  risk: `A curator's vault can underperform or change strategy, so spread the deposit across two curators instead of one.`,
+};
+
+const BASIS: FarmProfile = {
+  core: (x) => `Deposit $${x.k} into ${x.n}'s basis vault on ${x.c} and keep the shares.`,
+  weekly: (x) => `Check the vault's funding rate on ${x.n} and add $10 when the rate is positive.`,
+  milestone: (x) => `Hold the basis position for ${x.hold} days through at least one funding cycle.`,
+  check: (x) => `Open ${x.n}'s own page on ${x.c} and check the vault shares and any points balance before you withdraw.`,
+  unwind: (x) => `Redeem the basis vault shares for USDC and confirm the final balance.`,
+  risk: `Basis trades earn funding when it is positive and pay it when it turns negative, so a long negative stretch can eat the yield.`,
+};
+
+const BRIDGE: FarmProfile = {
+  core: (x) => `Bridge $${x.k} of USDC to ${x.c} through ${x.n} and use the bridged funds in its app.`,
+  weekly: (x) => `Bridge $10 of USDC through ${x.n} to a second chain and use it there, keeping the route in the protocol's own app.`,
+  milestone: (x) => `Complete at least four bridges through ${x.n} over ${x.hold} days, totalling more than $${x.k}.`,
+  check: (x) => `Open ${x.n}'s own app and check the bridge history and any points balance before you bridge again.`,
+  unwind: (x) => `Bridge the remaining funds back to your main chain through ${x.n}'s own app and confirm receipt.`,
+  risk: `A bridge moves funds across chains, so use only the protocol's own app and never a link from a chat or a search ad.`,
+};
+
+const STAKING: FarmProfile = {
+  core: (x) => `Stake $${x.k} of the chain's staking asset through ${x.n} on ${x.c} and keep the receipt token.`,
+  weekly: (x) => `Claim any staking rewards on ${x.n} and restake $10 of them through the same pool.`,
+  milestone: (x) => `Keep the stake locked for ${x.hold} days and restake the rewards at least twice.`,
+  check: (x) => `Open ${x.n}'s own staking page on ${x.c} and check the staked balance, the unlock time and any points balance.`,
+  unwind: (x) => `Unstake through ${x.n}, wait out the unlock period, and confirm the assets return to your wallet.`,
+  risk: `Staked assets can be locked or slashed, so check the unlock time before you stake.`,
+};
+
+const PERPS: FarmProfile = {
+  core: (x) => `Deposit $${x.k} of USDC as margin on ${x.n} on ${x.c} and open one small hedged trade at low leverage.`,
+  weekly: (x) => `Close the week's trade on ${x.n}, take any profit, and open one fresh small hedged trade.`,
+  milestone: (x) => `Complete at least four small hedged trades on ${x.n} over ${x.hold} days without ever raising the leverage.`,
+  check: (x) => `Open ${x.n}'s own trading page on ${x.c} and check the margin, the open positions and any points balance.`,
+  unwind: (x) => `Close every open trade on ${x.n}, withdraw the USDC margin, and confirm the final balance.`,
+  risk: `Perpetual and leveraged positions can be liquidated in a sharp move, so keep the position small and the leverage low.`,
+};
+
+const PREDICTION: FarmProfile = {
+  core: (x) => `Fund $${x.k} on ${x.n} on ${x.c} and place one market position on an outcome you have researched.`,
+  weekly: (x) => `Place one small market position a week on ${x.n}, on a different market each time.`,
+  milestone: (x) => `Settle at least four positions on ${x.n} over ${x.hold} days, on four different markets.`,
+  check: (x) => `Open ${x.n}'s own markets page on ${x.c} and check the settled positions and any points balance.`,
+  unwind: (x) => `Wait for the open markets to settle, claim any winnings, and withdraw the remaining balance.`,
+  risk: `Prediction markets pay only if the outcome lands your way, so size each position as money you can lose.`,
+};
+
+const STABLE: FarmProfile = {
+  core: (x) => `Mint $${x.k} of the stable asset through ${x.n} on ${x.c} and hold it in your wallet.`,
+  weekly: (x) => `Check the stable asset's peg on ${x.n} and mint or redeem $10 to keep the position active.`,
+  milestone: (x) => `Hold the stable asset for ${x.hold} days and keep its balance above $${x.k} through the whole window.`,
+  check: (x) => `Open ${x.n}'s own page on ${x.c} and check the peg, the minted balance and any points balance.`,
+  unwind: (x) => `Redeem the stable asset for USDC through ${x.n}'s own app and confirm the final balance.`,
+  risk: `A stable asset can lose its peg, so do not put in funds you need at short notice.`,
+};
+
+const RWA: FarmProfile = {
+  core: (x) => `Mint $${x.k} of ${x.n}'s yield-bearing asset on ${x.c} and hold it.`,
+  weekly: (x) => `Claim the yield the asset has paid on ${x.n} and use $10 of it to mint more of the same asset.`,
+  milestone: (x) => `Hold the asset for ${x.hold} days and compound its yield at least twice.`,
+  check: (x) => `Open ${x.n}'s own page on ${x.c} and check the asset balance, the yield earned and any points balance.`,
+  unwind: (x) => `Redeem the asset for USDC through ${x.n}'s own app and confirm the final balance.`,
+  risk: `Real-world assets depend on an off-chain issuer, so read who holds the reserves before you mint.`,
+};
+
+const INSURANCE: FarmProfile = {
+  core: (x) => `Buy $${x.k} of cover from ${x.n} on ${x.c} and keep the policy active.`,
+  weekly: (x) => `Check the policy's status on ${x.n} and top up the cover by $10 if the protected position has grown.`,
+  milestone: (x) => `Keep the cover active for ${x.hold} days, matching the position it protects.`,
+  check: (x) => `Open ${x.n}'s own page on ${x.c} and check the policy, its expiry and any points balance.`,
+  unwind: (x) => `Let the policy expire or cancel it through ${x.n}'s own app, and withdraw any unused premium.`,
+  risk: `Cover pays only for the events the policy names, so read what is excluded before you buy.`,
+};
+
+const FARM: FarmProfile = {
+  core: (x) => `Deposit $${x.k} into ${x.n}'s main farm on ${x.c} and keep the position open.`,
+  weekly: (x) => `Claim the farm rewards on ${x.n} and stake $10 of them back into the same farm.`,
+  milestone: (x) => `Keep the farm position open for ${x.hold} days and claim rewards at least twice.`,
+  check: (x) => `Open ${x.n}'s own farm page on ${x.c} and check the staked balance, the rewards and any points balance.`,
+  unwind: (x) => `Unstake from the farm, claim the final rewards, and withdraw the deposit.`,
+  risk: `Farm rewards can fall as more farmers join, so check the current rate before you deposit.`,
+};
+
+const CHAIN_APP: FarmProfile = {
+  core: (x) => `Bridge $${x.k} of USDC onto ${x.n} on ${x.c} and use it in one of its apps, such as a swap or a deposit.`,
+  weekly: (x) => `Use a different app on ${x.n} each week — a swap one week, a deposit the next — with $10 each time.`,
+  milestone: (x) => `Use at least three different apps on ${x.n} over ${x.hold} days, with more than $${x.k} moved in total.`,
+  check: (x) => `Open ${x.n}'s own hub on ${x.c} and check the activity history and any points balance.`,
+  unwind: (x) => `Bridge the remaining funds back to your main chain through ${x.n}'s own bridge and confirm receipt.`,
+  risk: `A new chain's apps can be thin and its bridge can be slow, so test with a small amount before you move the full deposit.`,
+};
+
+const PAYMENTS: FarmProfile = {
+  core: (x) => `Use ${x.n} on ${x.c} to send a $${x.k} payment to your own second wallet, and confirm it arrives.`,
+  weekly: (x) => `Send one $10 payment a week through ${x.n} to a different recipient address each time.`,
+  milestone: (x) => `Complete at least four payments through ${x.n} over ${x.hold} days, totalling more than $${x.k}.`,
+  check: (x) => `Open ${x.n}'s own app on ${x.c} and check the payment history and any points balance.`,
+  unwind: (x) => `Stop new payments, withdraw any balance left in ${x.n} to your wallet, and confirm receipt.`,
+  risk: `Payments are final once sent, so check the recipient address twice and test with a small amount first.`,
+};
+
+const LAUNCHPAD: FarmProfile = {
+  core: (x) => `Deposit $${x.k} of USDC into ${x.n}'s current sale allocation on ${x.c} and keep the receipt.`,
+  weekly: (x) => `Check ${x.n}'s sale calendar and join one new allocation a week with $10 if one is open.`,
+  milestone: (x) => `Hold the allocation through its sale window and claim the tokens within ${x.hold} days of the sale closing.`,
+  check: (x) => `Open ${x.n}'s own sales page on ${x.c} and check the allocation, the claim time and any points balance.`,
+  unwind: (x) => `Claim the allocated tokens, sell or hold them as you choose, and withdraw any unspent USDC.`,
+  risk: `A launchpad sale can sell out or the token can fall after listing, so never commit funds you need back quickly.`,
+};
+
+const INDEXES: FarmProfile = {
+  core: (x) => `Buy $${x.k} of ${x.n}'s index token on ${x.c} and hold it.`,
+  weekly: (x) => `Check the index's composition on ${x.n} and add $10 when it rebalances into a new asset.`,
+  milestone: (x) => `Hold the index token for ${x.hold} days through at least one rebalance.`,
+  check: (x) => `Open ${x.n}'s own page on ${x.c} and check the index holdings and any points balance.`,
+  unwind: (x) => `Redeem the index token for its underlying assets or USDC and confirm the final balance.`,
+  risk: `An index follows its basket, so a fall in one large holding can drag the whole token down.`,
+};
+
+const PRIVACY: FarmProfile = {
+  core: (x) => `Deposit $${x.k} into ${x.n}'s privacy pool on ${x.c} and keep the withdrawal note safe.`,
+  weekly: (x) => `Make one $10 deposit a week into ${x.n}'s pool, using a fresh address each time.`,
+  milestone: (x) => `Keep deposits in the pool for ${x.hold} days, spread across at least four different addresses.`,
+  check: (x) => `Open ${x.n}'s own app on ${x.c} and check the pool balance and any points balance — never share the note.`,
+  unwind: (x) => `Withdraw from the pool to a fresh address through ${x.n}'s own app and confirm receipt.`,
+  risk: `A privacy pool's note is the only key to the funds: lose it and the deposit is gone for good.`,
+};
+
+const GOVERNANCE: FarmProfile = {
+  core: (x) => `Deposit $${x.k} into ${x.n}'s governance vault on ${x.c} to receive voting power, and keep it locked.`,
+  weekly: (x) => `Vote on one open proposal a week through ${x.n}, and add $10 to the vault when a new vote opens.`,
+  milestone: (x) => `Vote on at least four proposals through ${x.n} over ${x.hold} days, keeping the deposit locked throughout.`,
+  check: (x) => `Open ${x.n}'s own governance page on ${x.c} and check the votes cast and any points balance.`,
+  unwind: (x) => `Wait out the lock, withdraw the deposit from the governance vault, and confirm receipt.`,
+  risk: `Governance deposits can be locked through a vote, so check the unlock time before you lock the funds.`,
+};
+
+const OTC: FarmProfile = {
+  core: (x) => `Place a $${x.k} OTC order through ${x.n} on ${x.c} for an asset you want, at a price you set.`,
+  weekly: (x) => `Place one $10 OTC order a week through ${x.n}, on a different asset each time.`,
+  milestone: (x) => `Complete at least four OTC trades through ${x.n} over ${x.hold} days.`,
+  check: (x) => `Open ${x.n}'s own marketplace on ${x.c} and check the filled orders and any points balance.`,
+  unwind: (x) => `Cancel any open orders on ${x.n} and withdraw the unspent balance to your wallet.`,
+  risk: `An OTC order fills only at your price, so an order set far from the market can sit unfilled for weeks.`,
+};
+
+const CARD: FarmProfile = {
+  core: (x) => `Load $${x.k} onto ${x.n}'s card on ${x.c} and spend $10 of it on an everyday purchase.`,
+  weekly: (x) => `Spend $10 a week through ${x.n}'s card, on a different merchant each time.`,
+  milestone: (x) => `Spend through ${x.n}'s card at least four times over ${x.hold} days, totalling more than $${x.k}.`,
+  check: (x) => `Open ${x.n}'s own app on ${x.c} and check the card balance, the spend history and any points balance.`,
+  unwind: (x) => `Stop new spending, withdraw any balance left on the card, and confirm receipt.`,
+  risk: `Card balances are held by the issuer, so keep only spending money on the card, not savings.`,
+};
+
+const LOCKER: FarmProfile = {
+  core: (x) => `Lock $${x.k} of tokens through ${x.n} on ${x.c} for the lock period it offers, and keep the receipt.`,
+  weekly: (x) => `Check the lock's countdown on ${x.n} and lock a further $10 of tokens if a new lock window opens.`,
+  milestone: (x) => `Keep the tokens locked for ${x.hold} days, through at least one full lock window.`,
+  check: (x) => `Open ${x.n}'s own page on ${x.c} and check the lock, its release date and any points balance.`,
+  unwind: (x) => `Claim the tokens when the lock releases, and confirm they arrive in your wallet.`,
+  risk: `Locked tokens cannot be sold until the release date, so never lock funds you may need sooner.`,
+};
+
+const BTC_YIELD: FarmProfile = {
+  core: (x) => `Deposit $${x.k} of a BTC-backed asset into ${x.n} on ${x.c} and keep the receipt token.`,
+  weekly: (x) => `Claim the yield the BTC position has paid on ${x.n} and add $10 of it to the same position.`,
+  milestone: (x) => `Hold the BTC position for ${x.hold} days and compound its yield at least twice.`,
+  check: (x) => `Open ${x.n}'s own page on ${x.c} and check the BTC balance, the yield earned and any points balance.`,
+  unwind: (x) => `Redeem the BTC-backed asset through ${x.n} and confirm the BTC arrives in your wallet.`,
+  risk: `A BTC-backed asset depends on its custodian or bridge, so read who holds the BTC before you deposit.`,
+};
+
+const SYNTHETICS: FarmProfile = {
+  core: (x) => `Mint $${x.k} of a synthetic asset through ${x.n} on ${x.c} against USDC collateral.`,
+  weekly: (x) => `Check the synthetic's price on ${x.n} and top up the collateral by $10 if it has slipped.`,
+  milestone: (x) => `Keep the synthetic position open for ${x.hold} days without letting the collateral ratio fall below 150%.`,
+  check: (x) => `Open ${x.n}'s own page on ${x.c} and check the collateral ratio and any points balance before you burn.`,
+  unwind: (x) => `Burn the synthetic asset, withdraw the USDC collateral, and confirm the final balance.`,
+  risk: `A synthetic can be liquidated if its collateral falls, so keep the ratio well above the minimum.`,
+};
+
+const LEVERAGED_FARM: FarmProfile = {
+  core: (x) => `Deposit $${x.k} into ${x.n}'s leveraged farm on ${x.c} at its lowest leverage setting and keep the position open.`,
+  weekly: (x) => `Check the farm's leverage and health on ${x.n}, and reduce the leverage if the position has slipped.`,
+  milestone: (x) => `Keep the leveraged position open for ${x.hold} days without ever raising the leverage above its start.`,
+  check: (x) => `Open ${x.n}'s own farm page on ${x.c} and check the leverage, the rewards and any points balance.`,
+  unwind: (x) => `Close the leveraged position, repay any borrowed funds, and withdraw the remaining deposit.`,
+  risk: `Leveraged farms amplify losses as well as gains, so the lowest leverage setting is the only sane start.`,
+};
+
+const GENERIC: FarmProfile = {
+  core: (x) => `Deposit $${x.k} of USDC into ${x.n} on ${x.c} and keep the position open.`,
+  weekly: (x) => `Make one qualifying action a week on ${x.n} — a deposit, a swap or a vote — with $10 each time.`,
+  milestone: (x) => `Keep the position open for ${x.hold} days and make at least four weekly actions in that time.`,
+  check: (x) => `Open ${x.n}'s own page on ${x.c} and check the position and any points balance before you withdraw.`,
+  unwind: (x) => `Withdraw the position from ${x.n} back to USDC and confirm the final balance.`,
+  risk: `Smart contracts can fail, so use only the funds you plan to farm and keep the position small.`,
+};
+
+/** The farm profile for one category, matched most-specific first: a leveraged farm is not a
+ * plain farm, a yield aggregator is not a plain yield vault, and a CDP manager is a CDP. */
+function profileFor(category: string | null): FarmProfile {
+  const c = (category ?? '').toLowerCase();
+  if (c.includes('leveraged')) return LEVERAGED_FARM;
+  if (c.includes('liquidity manager')) return MANAGED_LP;
+  if (c.includes('dex')) return DEX;
+  if (c.includes('lending')) return LENDING;
+  if (c.includes('cdp')) return CDP;
+  if (c.includes('collateral')) return LENDING;
+  if (c.includes('aggregator')) return AGGREGATOR;
+  if (c.includes('yield')) return YIELD_VAULT;
+  if (c.includes('curator') || c.includes('allocator')) return CURATOR;
+  if (c.includes('basis')) return BASIS;
+  if (c.includes('bridge') || c.includes('cross chain')) return BRIDGE;
+  if (c.includes('restak') || c.includes('staking')) return STAKING;
+  if (c.includes('perpetual') || c.includes('derivative') || c.includes('options')) return PERPS;
+  if (c.includes('prediction')) return PREDICTION;
+  if (c.includes('stable') || c.includes('dual-token')) return STABLE;
+  if (c.includes('rwa')) return RWA;
+  if (c.includes('insurance')) return INSURANCE;
+  if (c.includes('farm')) return FARM;
+  if (c.includes('payment')) return PAYMENTS;
+  if (c.includes('launchpad')) return LAUNCHPAD;
+  if (c.includes('index')) return INDEXES;
+  if (c.includes('privacy')) return PRIVACY;
+  if (c.includes('governance')) return GOVERNANCE;
+  if (c.includes('otc')) return OTC;
+  if (c.includes('card')) return CARD;
+  if (c.includes('locker')) return LOCKER;
+  if (c.includes('btc')) return BTC_YIELD;
+  if (c.includes('synthetic')) return SYNTHETICS;
+  if (c === 'chain') return CHAIN_APP;
+  return GENERIC;
 }
 
 /**
  * A protocol's farm plan: seven steps, each an action with a cost and a time. The plan is derived
  * from the protocol's own record (category, chains, TVL, age), never from a hand-written list of
- * names. The last step is the category's own risk, so the plan says what can go wrong as well as
- * what to do.
+ * names: the funding step follows its main chain, the core, weekly, milestone, check and exit
+ * steps follow its category's own mechanics, a multi-chain protocol's weekly step repeats the
+ * core action once on its second chain, and the last step is the category's risk plus the main
+ * chain's own risk. Two protocols share a step only when their records genuinely coincide.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const chain = chainOf(p);
+  const chain2 = secondChainOf(p);
   const capital = capitalFor(p);
+  const half = Math.max(10, Math.round(capital / 2));
   const hold = holdDaysFor(age);
-  const action = actionFor(p, capital, chain);
-  const gas = isLowFeeChain(chain) ? 'under $1' : 'about $5';
-  const setupGas = isLowFeeChain(chain) ? 'about $2' : 'about $8';
+  const prof = profileFor(p.category);
+  const gas = gasFor(chain);
+  const ctx: FarmCtx = { n: p.name, c: chain, k: capital, h: half, hold };
+  let weekly = prof.weekly(ctx);
+  if (chain2 !== null) weekly += ` Once, repeat the core action on ${chain2} with $${half} so the activity spans two chains.`;
   return [
     {
-      text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.`,
-      cost: 'under $3 of gas for the first transaction',
-      time: '5 minutes',
+      text: fundFor(chain, capital),
+      cost: `$${capital} of capital and ${gas.fund} of gas`,
+      time: '10 minutes to fund',
     },
     {
-      text: action,
-      cost: `$${capital} of capital and ${setupGas} of gas`,
+      text: prof.core(ctx),
+      cost: `$${capital} of capital and ${gas.setup} of gas`,
       time: '15 minutes to set up',
     },
     {
-      text: `Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.`,
-      cost: `${gas} of gas a week`,
+      text: weekly,
+      cost: chain2 !== null ? `${gas.weekly} of gas a week, plus $${half} once on ${chain2}` : `${gas.weekly} of gas a week`,
       time: '10 minutes a week',
     },
     {
-      text: `Hold the position for at least ${hold} days so the activity is counted in more than one snapshot.`,
+      text: prof.milestone(ctx),
       cost: `the $${capital} stays in the position`,
       time: `${hold} days`,
     },
     {
-      text: `Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes.`,
+      text: prof.check(ctx),
       cost: 'no fee to check, and never pay to claim',
       time: '10 minutes',
     },
     {
-      text: `Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it.`,
-      cost: 'nothing but the log',
-      time: '5 minutes',
+      text: `Write the wallet, the dates and every transaction in a farm log. ${prof.unwind(ctx)}`,
+      cost: 'nothing but the log, plus gas to exit',
+      time: '10 minutes to unwind',
     },
     {
-      text: riskFor(p),
+      text: `${prof.risk} ${chainRisk(chain)}`,
       cost: 'nothing to read, and it can save the whole position',
       time: '5 minutes',
     },
@@ -596,14 +962,19 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
     }));
 }
 
-/** One category's comparable multiple, for the dashboard's comparables table. */
+/** One category's comparable multiple, for the dashboard's comparables table. The multiple
+ * shown is the shrunk one the board actually uses: a thin category's factor is pulled toward
+ * the market median by n / (n + shrink_prior), so the table never shows a multiple built from
+ * a single outlier comparable at full strength. */
 export function comparableRows(snapshot: Snapshot, model: ModelConstants = MODEL): ComparableRow[] {
-  const comparables = measureComparables(snapshot);
+  const comparables = measureComparables(snapshot, model);
   const rows: ComparableRow[] = [];
   for (const [category, measured] of [...comparables.byCategory.entries()].sort((a, b) => b[1].count - a[1].count)) {
-    if (measured.count < model.min_category_comparables) continue;
+    if (measured.count < 1) continue;
     const rawFactor = measured.median / comparables.overall;
-    const factor = Math.min(model.category_factor_cap, Math.max(model.category_factor_floor, rawFactor));
+    const clamped = Math.min(model.category_factor_cap, Math.max(model.category_factor_floor, rawFactor));
+    const weight = measured.count / (measured.count + model.shrink_prior);
+    const factor = 1 + weight * (clamped - 1);
     rows.push({
       category,
       comparables: measured.count,
@@ -634,6 +1005,7 @@ export function radarRow(row: BoardRow, watchlist: Set<string>): RadarRow {
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     category_multiple: row.model.category_multiple,
+    stable_haircut: row.model.stable_haircut,
     watchlist: watchlist.has(row.slug),
     farm_steps: row.farm_steps,
   };

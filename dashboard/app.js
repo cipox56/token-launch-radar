@@ -4,9 +4,12 @@
 //
 // The board ranks every genuine pre-token protocol in the snapshot by an implied value the model
 // derives from the snapshot itself: the market's own mcap/TVL for the protocol's category, measured
-// from the token-trading protocols in the same snapshot, times TVL, adjusted for seven-day growth
-// and for how long the protocol has run with no token. The farm plan is the one board.json carries
-// for that row, shown verbatim, so the page and the board can never disagree.
+// from the token-trading protocols in the same snapshot and shrunk toward the market median when
+// the category has few comparables (each comparable ratio winsorized to [0.005, 5] first), times
+// TVL, adjusted for seven-day growth (clamped to [-40, 60]) and for how long the protocol has run
+// with no token, and halved for a stable-asset protocol whose TVL is largely the pegged asset's
+// own supply. The farm plan is the one board.json carries for that row, shown verbatim, so the
+// page and the board can never disagree.
 (function () {
   'use strict';
 
@@ -44,7 +47,8 @@
     var age = row.age_days === null || row.age_days === undefined ? model.unknown_age_days : row.age_days;
     var maturity = model.maturity_floor + (Math.min(Math.max(age, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
     var mult = row.category_multiple !== undefined && row.category_multiple !== null ? row.category_multiple : DATA.overall_multiple;
-    return Math.max(1, Math.round(row.tvl_usd * mult * growthMult * maturity));
+    var haircut = row.stable_haircut !== undefined && row.stable_haircut !== null ? row.stable_haircut : 1;
+    return Math.max(1, Math.round(row.tvl_usd * mult * growthMult * maturity * haircut));
   }
 
   function el(tag, attrs) {
@@ -290,13 +294,85 @@
     });
     return el('section', { class: 'panel model' },
       el('h2', { text: 'Comparables: what the market pays per dollar of TVL' }),
-      el('p', { class: 'sub', text: 'Each category\u2019s multiple is the median market cap over TVL of the token-trading protocols in that category in the same snapshot (at least 3 comparables, otherwise the market median of ' + fmtMult(DATA.overall_multiple) + '). The factor is bounded between 0.5x and 2x so one noisy category cannot dominate the board.' }),
+      el('p', { class: 'sub', text: 'Each category\u2019s multiple is the median market cap over TVL of the token-trading protocols in that category in the same snapshot, each ratio winsorized to [0.005, 5] first. The factor is shrunk toward the market median by n / (n + ' + DATA.model.shrink_prior + '), so a category with one comparable moves only a quarter of the way from the market median of ' + fmtMult(DATA.overall_multiple) + '; the factor is bounded between ' + DATA.model.category_factor_floor + 'x and ' + DATA.model.category_factor_cap + 'x.' }),
       el('div', { class: 'table-wrap' },
         el('table', null,
           el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Category' }), el('th', { scope: 'col', text: 'Comparables' }), el('th', { scope: 'col', text: 'Median mcap / TVL' }), el('th', { scope: 'col', text: 'Factor' }), el('th', { scope: 'col', text: 'Multiple used' }))),
           tbody
         )
       )
+    );
+  }
+
+  /** Where the board's implied value sits, by category: the eight largest categories, each
+   * with its share of the board's total implied value and its row count. */
+  function summaryPanel() {
+    var totals = {};
+    DATA.rows.forEach(function (r) {
+      var key = r.category || 'Other';
+      if (!totals[key]) totals[key] = { value: 0, count: 0 };
+      totals[key].value += r.implied_value_usd;
+      totals[key].count += 1;
+    });
+    var cats = Object.keys(totals).map(function (k) { return { name: k, value: totals[k].value, count: totals[k].count }; })
+      .sort(function (a, b) { return b.value - a.value; }).slice(0, 8);
+    var total = cats.reduce(function (s, c) { return s + c.value; }, 0);
+    var allTotal = DATA.rows.reduce(function (s, r) { return s + r.implied_value_usd; }, 0);
+    var rows = cats.map(function (c) {
+      var pct = allTotal > 0 ? Math.round((c.value / allTotal) * 100) : 0;
+      return el('div', { class: 'catbar' },
+        el('span', { class: 'catbar-name', text: c.name + ' (' + c.count + ')' }),
+        el('div', { class: 'bar catbar-bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(2, Math.round((c.value / (cats[0].value || 1)) * 100)) + '%' })),
+        el('span', { class: 'num', text: fmtUsd(c.value) + ' · ' + pct + '%' })
+      );
+    });
+    return el('section', { class: 'panel model' },
+      el('h2', { text: 'Where the value sits' }),
+      el('p', { class: 'sub', text: 'Total implied value by category, top eight of the board. Risk curators and capital allocators dominate because a few very large protocols sit there — the board is a value ranking, not a category vote.' }),
+      el('div', { class: 'catbars' }, rows),
+      el('p', { class: 'sub', text: 'Top eight categories: ' + fmtUsd(total) + ' of ' + fmtUsd(allTotal) + ' total implied value.' })
+    );
+  }
+
+  /** TVL against implied value, log-log: a protocol above the diagonal earns a richer multiple
+   * than its size alone would give. Watchlist protocols are the filled dots. Drawn with plain
+   * positioned dots, so the page needs no image and no namespace. */
+  function scatterPanel() {
+    var xs = DATA.rows.map(function (r) { return Math.log10(Math.max(1, r.tvl_usd)); });
+    var ys = DATA.rows.map(function (r) { return Math.log10(Math.max(1, r.implied_value_usd)); });
+    var x0 = Math.floor(Math.min.apply(null, xs)), x1 = Math.ceil(Math.max.apply(null, xs));
+    var y0 = Math.floor(Math.min.apply(null, ys)), y1 = Math.ceil(Math.max.apply(null, ys));
+    var plot = el('div', { class: 'scatter-plot', role: 'img', 'aria-label': 'Scatter plot of TVL against implied value on log scales; the three largest protocols are labelled.' });
+    for (var gx = x0; gx <= x1; gx++) {
+      var left = ((gx - x0) / (x1 - x0)) * 100;
+      plot.appendChild(el('div', { class: 'grid-v', style: 'left:' + left.toFixed(2) + '%' }));
+      plot.appendChild(el('span', { class: 'axis-x', style: 'left:' + left.toFixed(2) + '%', text: fmtUsd(Math.pow(10, gx)) }));
+    }
+    for (var gy = y0; gy <= y1; gy++) {
+      var bottom = ((gy - y0) / (y1 - y0)) * 100;
+      plot.appendChild(el('div', { class: 'grid-h', style: 'bottom:' + bottom.toFixed(2) + '%' }));
+      plot.appendChild(el('span', { class: 'axis-y', style: 'bottom:' + bottom.toFixed(2) + '%', text: fmtUsd(Math.pow(10, gy)) }));
+    }
+    DATA.rows.forEach(function (r) {
+      var left = ((Math.log10(Math.max(1, r.tvl_usd)) - x0) / (x1 - x0)) * 100;
+      var bottom = ((Math.log10(Math.max(1, r.implied_value_usd)) - y0) / (y1 - y0)) * 100;
+      var dot = el('i', { class: 'dot' + (r.watchlist ? ' dot-watch' : ''), style: 'left:' + left.toFixed(2) + '%;bottom:' + bottom.toFixed(2) + '%', title: r.name + ': TVL ' + fmtUsd(r.tvl_usd) + ', implied ' + fmtUsd(r.implied_value_usd) });
+      plot.appendChild(dot);
+    });
+    // The three largest dots cluster at the top right, so only the third is labelled in place;
+    // the caption below names all three, where the text cannot collide.
+    var third = DATA.rows[2];
+    if (third) {
+      var lx = ((Math.log10(Math.max(1, third.tvl_usd)) - x0) / (x1 - x0)) * 100;
+      var lb = ((Math.log10(Math.max(1, third.implied_value_usd)) - y0) / (y1 - y0)) * 100;
+      plot.appendChild(el('span', { class: 'dot-label', style: 'left:' + (lx - 13).toFixed(2) + '%;bottom:' + (lb - 1).toFixed(2) + '%', text: '#3 ' + third.name }));
+    }
+    var top3 = DATA.rows.slice(0, 3).map(function (r) { return '#' + r.rank + ' ' + r.name + ' ' + fmtUsd(r.implied_value_usd); }).join(', ');
+    return el('section', { class: 'panel model' },
+      el('h2', { text: 'TVL against implied value' }),
+      el('p', { class: 'sub', text: 'Each dot is one protocol, log scales on both axes. A dot above the pack earns a richer multiple than its size alone would give; filled dots are watchlist protocols.' }),
+      plot,
+      el('p', { class: 'sub', text: 'Largest by implied value: ' + top3 + '. Horizontal axis: TVL. Vertical axis: implied value.' })
     );
   }
 
@@ -308,9 +384,9 @@
       el('h2', { text: 'How implied value is computed' }),
       el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
       el('div', { class: 'formula' },
-        'implied = round( tvl_usd x category_multiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') )'
+        'implied = round( tvl_usd x category_multiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x stable_haircut )'
       ),
-      el('p', { class: 'sub', text: 'category_multiple is the market\u2019s own mcap/TVL for the protocol\u2019s category, measured from the token-trading protocols in this snapshot (at least ' + m.min_category_comparables + ' comparables, otherwise the market median of ' + fmtMult(DATA.overall_multiple) + '; the factor is bounded between ' + m.category_factor_floor + 'x and ' + m.category_factor_cap + 'x). TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days.' }),
+      el('p', { class: 'sub', text: 'category_multiple is the market\u2019s own mcap/TVL for the protocol\u2019s category, measured from the token-trading protocols in this snapshot: each ratio winsorized to [' + m.winsor_ratio_floor + ', ' + m.winsor_ratio_cap + '], the category median shrunk toward the market median of ' + fmtMult(DATA.overall_multiple) + ' by n / (n + ' + m.shrink_prior + ') where n is the category\u2019s comparable count, and the factor bounded between ' + m.category_factor_floor + 'x and ' + m.category_factor_cap + 'x. TVL and seven-day growth come from the snapshot — change_7d is its only trend field, and the snapshot\u2019s largest weekly move is +4,448%, so the clamp is what keeps one spike from deciding a rank. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. stable_haircut is ' + m.stable_haircut + ' for a stable-asset protocol (CDP, dual-token stablecoin, stablecoin wrapper), whose TVL is largely the pegged asset\u2019s own supply, and 1 otherwise.' }),
       dc ? el('p', { class: 'sub', text: driverLine }) : null
     );
   }
@@ -356,6 +432,7 @@
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
         el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: String(row.growth_multiplier) })),
         el('div', null, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: String(row.maturity_multiplier) })),
+        row.stable_haircut !== undefined && row.stable_haircut !== null && row.stable_haircut < 1 ? el('div', null, el('span', { text: 'Stable-asset haircut' }), el('b', { class: 'num', text: String(row.stable_haircut) + 'x — TVL is largely the pegged asset\u2019s own supply' })) : null,
         el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
       ),
       el('p', { class: 'sub', text: why }),
@@ -396,6 +473,8 @@
     shell.appendChild(controls());
     shell.appendChild(state.tab === 'pre-token' ? boardTable() : liveTable());
     if (state.tab === 'pre-token') {
+      shell.appendChild(summaryPanel());
+      shell.appendChild(scatterPanel());
       shell.appendChild(comparablesPanel());
       shell.appendChild(modelPanel());
     }

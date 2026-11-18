@@ -103,6 +103,19 @@ tbody tr[data-selected="true"] { background: color-mix(in srgb, var(--accent) 8%
 .status::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
 
 .model { margin-top: var(--step-4); padding: var(--step-5); display: grid; gap: var(--step-3); }
+.catbars { display: grid; gap: var(--step-2); }
+.catbar { display: grid; grid-template-columns: minmax(180px, 1.1fr) minmax(120px, 2fr) auto; align-items: center; gap: var(--step-3); font-size: 13px; }
+.catbar-name { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.catbar-bar { width: auto; }
+.scatter { width: 100%; height: auto; display: block; border-radius: var(--radius-control); }
+.scatter-plot { position: relative; height: 300px; margin: var(--step-2) 48px var(--step-5) 56px; border-left: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+.grid-v { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--border); }
+.grid-h { position: absolute; left: 0; right: 0; height: 1px; background: var(--border); }
+.axis-x { position: absolute; bottom: -20px; transform: translateX(-50%); color: var(--muted); font-size: 11px; white-space: nowrap; }
+.axis-y { position: absolute; left: -52px; transform: translateY(50%); color: var(--muted); font-size: 11px; white-space: nowrap; }
+.dot { position: absolute; width: 7px; height: 7px; margin-left: -3px; margin-bottom: -3px; border-radius: 50%; background: #9db8ab; }
+.dot-watch { width: 9px; height: 9px; margin-left: -4px; margin-bottom: -4px; background: var(--accent); }
+.dot-label { position: absolute; color: var(--ink); font-size: 11px; white-space: nowrap; }
 .formula { font-family: var(--font-num); font-size: 13px; line-height: 1.7; color: var(--muted); overflow-wrap: anywhere; }
 .empty { padding: var(--step-7) var(--step-5); text-align: center; display: grid; gap: var(--step-3); justify-items: center; }
 .empty p { color: var(--muted); }
